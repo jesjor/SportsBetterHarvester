@@ -3,16 +3,43 @@ Market Discovery
 ================
 Henter alle aktive live sports markeder fra Polymarket's Gamma API.
 Parser token IDs og metadata til brug i CLOB WS subscription.
+
+FIXES:
+- Bug fix: Gamma API bruger 'clobTokenIds' (array af strings), ikke 'tokens[].token_id'
+- Bug fix: Fallback /markets endpoint har samme token-parsing fix
+- Fjernet afhængighed af sports-ws.polymarket.com (blokeret på Railway)
 """
 
 import asyncio
 import logging
-import json
 from typing import Optional
 
 import aiohttp
 
 log = logging.getLogger("market_discovery")
+
+
+def _extract_token_ids(market: dict) -> list[str]:
+    """
+    Udtrækker token IDs fra et Gamma market objekt.
+    Prøver alle kendte felt-navne i prioriteret rækkefølge.
+    """
+    # Primær: clobTokenIds er et simpelt array af ID-strings
+    clob_ids = market.get("clobTokenIds") or market.get("clob_token_ids") or []
+    if clob_ids:
+        return [str(tid) for tid in clob_ids if tid]
+
+    # Sekundær: tokens array med token_id/tokenId felt
+    token_ids = []
+    for token in market.get("tokens", []):
+        tid = token.get("token_id") or token.get("tokenId")
+        if tid:
+            token_ids.append(str(tid))
+    if token_ids:
+        return token_ids
+
+    # Tertiær: allerede parset _token_ids
+    return [str(t) for t in market.get("_token_ids", []) if t]
 
 
 class MarketDiscovery:
@@ -24,12 +51,11 @@ class MarketDiscovery:
         Henter alle markets der:
         - Er aktive (active=true)
         - Er sports-relaterede (tag: sports)
-        - Er live/igangværende
+        - Har gyldige token IDs
         """
         all_markets = []
 
         async with aiohttp.ClientSession() as session:
-            # Strategi: Hent via /events endpoint med sports tag
             markets = await self._fetch_events_sports(session)
             all_markets.extend(markets)
 
@@ -50,12 +76,11 @@ class MarketDiscovery:
         markets = []
 
         try:
-            # Hent sports tags/kategorier
             url = f"{self.base_url}/events"
             params = {
-                "active": "true",
-                "closed": "false",
-                "limit": 500,
+                "active":   "true",
+                "closed":   "false",
+                "limit":    500,
                 "tag_slug": "sports",
             }
 
@@ -75,18 +100,15 @@ class MarketDiscovery:
                     if market.get("closed", False):
                         continue
 
-                    # Parser token IDs
-                    token_ids = []
-                    for token in market.get("tokens", []):
-                        tid = token.get("token_id") or token.get("tokenId")
-                        if tid:
-                            token_ids.append(tid)
-
+                    token_ids = _extract_token_ids(market)
                     if token_ids:
-                        market["_token_ids"] = token_ids
-                        market["_event_title"] = event.get("title", "")
-                        market["_event_slug"]  = event.get("slug", "")
+                        market["_token_ids"]    = token_ids
+                        market["_event_title"]  = event.get("title", "")
+                        market["_event_slug"]   = event.get("slug", "")
                         markets.append(market)
+
+            if markets:
+                log.info(f"Events endpoint: {len(markets)} aktive markets med token IDs")
 
         except asyncio.TimeoutError:
             log.warning("Gamma API timeout på events endpoint")
@@ -105,10 +127,10 @@ class MarketDiscovery:
         try:
             url = f"{self.base_url}/markets"
             params = {
-                "active":     "true",
-                "closed":     "false",
-                "limit":      500,
-                "tag_slug":   "sports",
+                "active":   "true",
+                "closed":   "false",
+                "limit":    500,
+                "tag_slug": "sports",
             }
             async with session.get(url, params=params,
                                    timeout=aiohttp.ClientTimeout(total=15)) as resp:
@@ -118,11 +140,7 @@ class MarketDiscovery:
 
             raw = data if isinstance(data, list) else data.get("markets", [])
             for m in raw:
-                token_ids = []
-                for token in m.get("tokens", []):
-                    tid = token.get("token_id") or token.get("tokenId")
-                    if tid:
-                        token_ids.append(tid)
+                token_ids = _extract_token_ids(m)
                 if token_ids:
                     m["_token_ids"] = token_ids
                     markets.append(m)
@@ -136,14 +154,8 @@ class MarketDiscovery:
         """Returnerer alle unikke token IDs fra en liste af markeder."""
         ids = set()
         for m in markets:
-            # Direkte _token_ids felt sat af os
-            for tid in m.get("_token_ids", []):
+            for tid in _extract_token_ids(m):
                 ids.add(tid)
-            # Alternativt fra tokens array
-            for token in m.get("tokens", []):
-                tid = token.get("token_id") or token.get("tokenId")
-                if tid:
-                    ids.add(tid)
         return list(ids)
 
     def classify_market(self, market: dict) -> str:
@@ -152,7 +164,6 @@ class MarketDiscovery:
         Returnerer en kort type-streng til brug i analyse.
         """
         q = (market.get("question") or market.get("_event_title") or "").lower()
-        slug = (market.get("slug") or market.get("_event_slug") or "").lower()
 
         if "both teams" in q or "btts" in q or "both score" in q:
             return "both_teams_score"

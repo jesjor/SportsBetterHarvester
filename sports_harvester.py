@@ -122,9 +122,12 @@ async def sports_ws_worker(db: Database, score_event_queue: asyncio.Queue):
     Ingen auth, ingen subscription message nødvendig.
     Sender pong ved server ping.
     Logger alle score-ændringer.
+    Hvis Sports WS er utilgængeligt (f.eks. blokeret på Railway), deaktiveres
+    denne worker gracefully — CLOB WS fortsætter uforstyrret.
     """
     game_states: dict[int, dict] = {}   # gameId → seneste state
-    reconnect_delay = 1.0
+    reconnect_delay = 5.0
+    consecutive_failures = 0
 
     while True:
         try:
@@ -134,7 +137,8 @@ async def sports_ws_worker(db: Database, score_event_queue: asyncio.Queue):
                 ping_interval=None,         # Vi håndterer ping/pong manuelt
                 max_size=10 * 1024 * 1024,
             ) as ws:
-                reconnect_delay = 1.0
+                reconnect_delay = 5.0
+                consecutive_failures = 0
                 log.info("Sports WS: Forbundet ✓")
 
                 last_ping = time.monotonic()
@@ -197,11 +201,21 @@ async def sports_ws_worker(db: Database, score_event_queue: asyncio.Queue):
 
         except websockets.exceptions.ConnectionClosed as e:
             log.warning(f"Sports WS: Forbindelse lukket: {e}. Genforbinder om {reconnect_delay}s...")
+        except OSError as e:
+            consecutive_failures += 1
+            if consecutive_failures == 1:
+                log.warning(f"Sports WS: Kan ikke nå {SPORTS_WS_URL} ({e}). "
+                            f"Sandsynligvis blokeret i dette miljø.")
+            if consecutive_failures >= 5:
+                log.warning("Sports WS: Permanent utilgængeligt. "
+                            "Deaktiverer — CLOB WS kører videre. "
+                            "Score events vil ikke blive registreret.")
+                return   # Afslut workeren — CLOB WS er upåvirket
         except Exception as e:
             log.error(f"Sports WS fejl: {e}", exc_info=True)
 
         await asyncio.sleep(reconnect_delay)
-        reconnect_delay = min(reconnect_delay * 2, 30)
+        reconnect_delay = min(reconnect_delay * 2, 120)  # Max 2 min
 
 
 # ──────────────────────────────────────────────
@@ -216,16 +230,18 @@ async def clob_ws_worker(db: Database, market_ids: list[str],
     Logger alle prisændringer med timestamp.
     Når en ScoreEvent ankommer, noterer vi latency.
     """
-    if not market_ids:
-        log.warning("CLOB WS: Ingen markeder at abonnere på. Venter...")
-        await asyncio.sleep(10)
-        return
-
     reconnect_delay = 1.0
 
     while True:
+        # Vent på at active_markets_ref bliver populeret
+        current_ids = active_markets_ref.get("asset_ids", [])
+        if not current_ids:
+            log.info("CLOB WS: Ingen asset IDs endnu — venter 5s...")
+            await asyncio.sleep(5)
+            continue
         try:
-            log.info(f"CLOB WS: Forbinder — {len(market_ids)} markeder")
+            current_ids = list(active_markets_ref.get("asset_ids", []))
+            log.info(f"CLOB WS: Forbinder — {len(current_ids)} markeder")
             async with websockets.connect(
                 CLOB_WS_URL,
                 ping_interval=None,
@@ -236,11 +252,11 @@ async def clob_ws_worker(db: Database, market_ids: list[str],
                 # Subscribe til alle markeder
                 sub_msg = {
                     "type": "market",
-                    "assets_ids": market_ids,
+                    "assets_ids": current_ids,
                     "custom_feature_enabled": True   # Får market_resolved events
                 }
                 await ws.send(json.dumps(sub_msg))
-                log.info(f"CLOB WS: Abonnerer på {len(market_ids)} asset IDs ✓")
+                log.info(f"CLOB WS: Abonnerer på {len(current_ids)} asset IDs ✓")
 
                 last_ping = time.monotonic()
 
@@ -363,10 +379,18 @@ async def market_refresh_loop(discovery: MarketDiscovery, active_markets: dict,
 
             new_asset_ids = set()
             for m in markets:
-                for token in m.get("tokens", []):
-                    tid = token.get("token_id") or token.get("tokenId")
-                    if tid:
-                        new_asset_ids.add(tid)
+                # Prøv clobTokenIds først (direkte array af strings) — primær kilde
+                clob_ids = m.get("clobTokenIds") or m.get("clob_token_ids") or []
+                if clob_ids:
+                    for tid in clob_ids:
+                        if tid:
+                            new_asset_ids.add(str(tid))
+                else:
+                    # Fallback: tokens array
+                    for token in m.get("tokens", []):
+                        tid = token.get("token_id") or token.get("tokenId")
+                        if tid:
+                            new_asset_ids.add(str(tid))
 
             old_ids = set(active_markets.get("asset_ids", []))
             if new_asset_ids != old_ids:
@@ -436,10 +460,17 @@ async def main():
     try:
         markets = await discovery.fetch_live_sports_markets()
         for m in markets:
-            for token in m.get("tokens", []):
-                tid = token.get("token_id") or token.get("tokenId")
-                if tid:
-                    active_markets["asset_ids"].append(tid)
+            # Prøv clobTokenIds først (direkte array af strings) — primær kilde
+            clob_ids = m.get("clobTokenIds") or m.get("clob_token_ids") or []
+            if clob_ids:
+                for tid in clob_ids:
+                    if tid:
+                        active_markets["asset_ids"].append(str(tid))
+            else:
+                for token in m.get("tokens", []):
+                    tid = token.get("token_id") or token.get("tokenId")
+                    if tid:
+                        active_markets["asset_ids"].append(str(tid))
         active_markets["markets"] = markets
         log.info(f"Fundet {len(markets)} live sports markeder, "
                  f"{len(active_markets['asset_ids'])} asset IDs")
